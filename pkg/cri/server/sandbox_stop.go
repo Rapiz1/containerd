@@ -34,6 +34,10 @@ import (
 // StopPodSandbox stops the sandbox. If there are any running containers in the
 // sandbox, they should be forcibly terminated.
 func (c *criService) StopPodSandbox(ctx context.Context, r *runtime.StopPodSandboxRequest) (*runtime.StopPodSandboxResponse, error) {
+	allObserver := StopPodSandboxDuration.WithValues("all")
+	allTs := time.Now()
+	defer allObserver.UpdateSince(allTs)
+
 	sandbox, err := c.sandboxStore.Get(r.GetPodSandboxId())
 	if err != nil {
 		return nil, errors.Wrapf(err, "an error occurred when try to find sandbox %q",
@@ -51,6 +55,8 @@ func (c *criService) stopPodSandbox(ctx context.Context, sandbox sandboxstore.Sa
 	// Use the full sandbox id.
 	id := sandbox.ID
 
+	contObserver := StopPodSandboxDuration.WithValues("container")
+	contTs := time.Now()
 	// Stop all containers inside the sandbox. This terminates the container forcibly,
 	// and container may still be created, so production should not rely on this behavior.
 	// TODO(random-liu): Introduce a state in sandbox to avoid future container creation.
@@ -65,11 +71,17 @@ func (c *criService) stopPodSandbox(ctx context.Context, sandbox sandboxstore.Sa
 			return errors.Wrapf(err, "failed to stop container %q", container.ID)
 		}
 	}
+	contObserver.UpdateSince(contTs)
 
+	fileObserver := StopPodSandboxDuration.WithValues("file")
+	fileTs := time.Now()
 	if err := c.cleanupSandboxFiles(id, sandbox.Config); err != nil {
 		return errors.Wrap(err, "failed to cleanup sandbox files")
 	}
+	fileObserver.UpdateSince(fileTs)
 
+	sandboxObserver := StopPodSandboxDuration.WithValues("sandbox")
+	sandboxTs := time.Now()
 	// Only stop sandbox container when it's running or unknown.
 	state := sandbox.Status.Get().State
 	if state == sandboxstore.StateReady || state == sandboxstore.StateUnknown {
@@ -77,7 +89,10 @@ func (c *criService) stopPodSandbox(ctx context.Context, sandbox sandboxstore.Sa
 			return errors.Wrapf(err, "failed to stop sandbox container %q in %q state", id, state)
 		}
 	}
+	sandboxObserver.UpdateSince(sandboxTs)
 
+	netObserver := StopPodSandboxDuration.WithValues("network")
+	netTs := time.Now()
 	// Teardown network for sandbox.
 	if sandbox.NetNS != nil {
 		// Use empty netns path if netns is not available. This is defined in:
@@ -94,6 +109,7 @@ func (c *criService) stopPodSandbox(ctx context.Context, sandbox sandboxstore.Sa
 			return errors.Wrapf(err, "failed to remove network namespace for sandbox %q", id)
 		}
 	}
+	netObserver.UpdateSince(netTs)
 
 	log.G(ctx).Infof("TearDown network for sandbox %q successfully", id)
 

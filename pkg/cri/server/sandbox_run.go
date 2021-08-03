@@ -22,6 +22,7 @@ import (
 	"path/filepath"
 	goruntime "runtime"
 	"strings"
+	"time"
 
 	"github.com/containerd/containerd"
 	containerdio "github.com/containerd/containerd/cio"
@@ -57,6 +58,9 @@ func init() {
 // RunPodSandbox creates and starts a pod-level sandbox. Runtimes should ensure
 // the sandbox is in ready state.
 func (c *criService) RunPodSandbox(ctx context.Context, r *runtime.RunPodSandboxRequest) (_ *runtime.RunPodSandboxResponse, retErr error) {
+	// Record the time of all stages
+	allObserver := RunPodSandboxDuration.WithValues("all")
+	allTs := time.Now()
 	config := r.GetConfig()
 	log.G(ctx).Debugf("Sandbox config %+v", config)
 
@@ -93,6 +97,9 @@ func (c *criService) RunPodSandbox(ctx context.Context, r *runtime.RunPodSandbox
 		},
 	)
 
+	// Record the time of pulling and converting the image
+	imgObserver := RunPodSandboxDuration.WithValues("image")
+	imgTs := time.Now()
 	// Ensure sandbox container image snapshot.
 	image, err := c.ensureImageExists(ctx, c.config.SandboxImage, config)
 	if err != nil {
@@ -102,6 +109,7 @@ func (c *criService) RunPodSandbox(ctx context.Context, r *runtime.RunPodSandbox
 	if err != nil {
 		return nil, errors.Wrapf(err, "failed to get image from containerd %q", image.ID)
 	}
+	imgObserver.UpdateSince(imgTs)
 
 	ociRuntime, err := c.getSandboxRuntime(config, r.GetRuntimeHandler())
 	if err != nil {
@@ -109,6 +117,9 @@ func (c *criService) RunPodSandbox(ctx context.Context, r *runtime.RunPodSandbox
 	}
 	log.G(ctx).Debugf("Use OCI %+v for sandbox %q", ociRuntime, id)
 
+	// Record the time of calling cni
+	netObserver := RunPodSandboxDuration.WithValues("net")
+	netTs := time.Now()
 	podNetwork := true
 	// Pod network is always needed on windows.
 	if goruntime.GOOS != "windows" &&
@@ -158,7 +169,11 @@ func (c *criService) RunPodSandbox(ctx context.Context, r *runtime.RunPodSandbox
 			return nil, errors.Wrapf(err, "failed to setup network for sandbox %q", id)
 		}
 	}
+	netObserver.UpdateSince(netTs)
 
+	// Record the time of creating a container in memory, which DOES NOT include calling shim
+	contObserver := RunPodSandboxDuration.WithValues("container")
+	contTs := time.Now()
 	// Create sandbox container.
 	// NOTE: sandboxContainerSpec SHOULD NOT have side
 	// effect, e.g. accessing/creating files, so that we can test
@@ -221,7 +236,11 @@ func (c *criService) RunPodSandbox(ctx context.Context, r *runtime.RunPodSandbox
 			}
 		}
 	}()
+	contObserver.UpdateSince(contTs)
 
+	// Record the time of setting up rootfs
+	fileObserver := RunPodSandboxDuration.WithValues("file")
+	fileTs := time.Now()
 	// Create sandbox container root directories.
 	sandboxRootDir := c.getSandboxRootDir(id)
 	if err := c.os.MkdirAll(sandboxRootDir, 0755); err != nil {
@@ -264,6 +283,7 @@ func (c *criService) RunPodSandbox(ctx context.Context, r *runtime.RunPodSandbox
 			}
 		}
 	}()
+	fileObserver.UpdateSince(fileTs)
 
 	// Update sandbox created timestamp.
 	info, err := container.Info(ctx)
@@ -271,6 +291,9 @@ func (c *criService) RunPodSandbox(ctx context.Context, r *runtime.RunPodSandbox
 		return nil, errors.Wrap(err, "failed to get sandbox container info")
 	}
 
+	// Record the time of creating and starting a task, which includes calling the nri plugin and the shim
+	taskObserver := RunPodSandboxDuration.WithValues("task")
+	taskTs := time.Now()
 	// Create sandbox task in containerd.
 	log.G(ctx).Tracef("Create sandbox container (id=%q, name=%q).",
 		id, name)
@@ -315,6 +338,7 @@ func (c *criService) RunPodSandbox(ctx context.Context, r *runtime.RunPodSandbox
 	if err := task.Start(ctx); err != nil {
 		return nil, errors.Wrapf(err, "failed to start sandbox container task %q", id)
 	}
+	taskObserver.UpdateSince(taskTs)
 
 	if err := sandbox.Status.Update(func(status sandboxstore.Status) (sandboxstore.Status, error) {
 		// Set the pod sandbox as ready after successfully start sandbox container.
@@ -340,6 +364,7 @@ func (c *criService) RunPodSandbox(ctx context.Context, r *runtime.RunPodSandbox
 	// but we don't care about sandbox TaskOOM right now, so it is fine.
 	c.eventMonitor.startSandboxExitMonitor(context.Background(), id, task.Pid(), exitCh)
 
+	allObserver.UpdateSince(allTs)
 	return &runtime.RunPodSandboxResponse{PodSandboxId: id}, nil
 }
 
